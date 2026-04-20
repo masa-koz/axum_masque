@@ -799,8 +799,7 @@ where
                 datagram.extend_from_slice(&buf[..len]);
 
                 if let Err(e) = datagram_sender.send_datagram(datagram.freeze()) {
-                    tracing::error!("send datagram error: {}", e);
-                    break;
+                    tracing::warn!("send datagram error: {}", e);
                 }
             }
         }
