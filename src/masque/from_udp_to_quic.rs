@@ -69,16 +69,16 @@ where
 {
     let socket = match rx.recv().await {
         Some(Message::RegisterSocket(socket, resp_tx)) => {
-            tracing::debug!("from_udp_to_quic_thread received RegisterSocket Message");
+            tracing::debug!("received RegisterSocket Message");
             resp_tx.send(anyhow::Ok(())).unwrap();
             socket
         }
         Some(_) => {
-            tracing::debug!("from_udp_to_quic_thread received unknown Message");
+            tracing::debug!("received unknown Message");
             return Ok(());
         }
         None => {
-            tracing::debug!("from_udp_to_quic_thread channel closed");
+            tracing::debug!("channel closed");
             return Ok(());
         }
     };
@@ -91,7 +91,7 @@ where
             msg = rx.recv() => {
                 match msg {
                     Some(Message::RegisterSocket(_, resp_tx)) => {
-                        tracing::debug!("from_udp_to_quic_thread received unexpected RegisterSocket Message");
+                        tracing::debug!("received unexpected RegisterSocket Message");
                         resp_tx.send(Err(anyhow::anyhow!("unexpected RegisterSocket Message"))).unwrap();
                     }
                     Some(Message::RegisterContextId(context_id, addr, resp_tx)) => {
@@ -105,12 +105,12 @@ where
                         resp_tx.send(anyhow::Ok(())).unwrap();
                     }
                     Some(Message::Finish(resp_tx)) => {
-                        tracing::info!("from_udp_to_quic_thread received Finish Message, exiting");
+                        tracing::info!("received Finish Message, exiting");
                         resp_tx.send(anyhow::Ok(())).unwrap();
                         return Ok(());
                     }
                     None => {
-                        tracing::debug!("from_udp_to_quic_thread channel closed");
+                        tracing::debug!("channel closed");
                         return Ok(());
                     }
                 }

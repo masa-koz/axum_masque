@@ -215,7 +215,7 @@ where
                             }
                         }
                         Err(e) => {
-                            tracing::error!("receive error: {}", e);
+                            tracing::warn!("receive error: {}", e);
                             break;
                         }
                     }

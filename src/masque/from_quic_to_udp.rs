@@ -77,11 +77,29 @@ where
     let mut compression_info: HashMap<(StreamId, u64), Option<SocketAddr>> = HashMap::new();
     loop {
         tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some(Message::RegisterSocket(stream_id, socket, resp_tx)) => {
+                        tracing::debug!("received RegisterSocket Message for stream id {}", stream_id);
+                        socket_info.insert(stream_id, socket);
+                        resp_tx.send(anyhow::Ok(())).unwrap();
+                    }
+                    Some(Message::RegisterContextId(stream_id, context_id, addr, resp_tx)) => {
+                        tracing::debug!("received RegisterContextID Message for stream id {}, context id {}, addr {:?}", stream_id, context_id, addr);
+                        compression_info.insert((stream_id, context_id), addr);
+                        resp_tx.send(anyhow::Ok(())).unwrap();
+                    }
+                    None => {
+                        tracing::debug!("channel closed");
+                        return Ok(());
+                    }
+                }
+            }
             datagram = datagram_reader.read_datagram() => {
                 let datagram = match datagram {
                     Ok(d) => d,
                     Err(e) => {
-                        tracing::error!("recv datagram error: {}", e);
+                        tracing::debug!("recv datagram error: {}", e);
                         break;
                     }
                 };
@@ -158,24 +176,6 @@ where
                 } else {
                     tracing::error!("failed to decode var int from datagram");
                     continue;
-                }
-            }
-            msg = rx.recv() => {
-                match msg {
-                    Some(Message::RegisterSocket(stream_id, socket, resp_tx)) => {
-                        tracing::debug!("from_quic_to_udp_thread received RegisterSocket Message for stream id {}", stream_id);
-                        socket_info.insert(stream_id, socket);
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                    }
-                    Some(Message::RegisterContextId(stream_id, context_id, addr, resp_tx)) => {
-                        tracing::debug!("from_quic_to_udp_thread received RegisterContextID Message for stream id {}, context id {}, addr {:?}", stream_id, context_id, addr);
-                        compression_info.insert((stream_id, context_id), addr);
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                    }
-                    None => {
-                        tracing::debug!("from_quic_to_udp_thread channel closed");
-                        return Ok(());
-                    }
                 }
             }
         }
