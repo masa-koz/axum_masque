@@ -14,7 +14,6 @@ bytes = "1"
 futures = "0.3"
 h3 = "0.0.8"
 h3-datagram = "0.0.2"
-h3-msquic-async = { path = "../msquic-async-rs/h3-msquic-async", default-features = false, features = ["msquic-seera", "msquic-seera-static", "msquic-seera-openssl-external", "datagram"] }
 h3-util = { path = "../tonic-h3/h3-util", default-features = false }
 http = "1"
 http-body = "1"

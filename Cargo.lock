@@ -70,7 +70,6 @@ dependencies = [
  "futures",
  "h3",
  "h3-datagram",
- "h3-msquic-async",
  "h3-util",
  "http",
  "http-body",
