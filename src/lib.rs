@@ -58,14 +58,15 @@ impl<S> BoundUdpProxyService<S> {
     }
 }
 
-impl<RS, BD, S> tower::Service<Request<H3IncomingServer<RS, Bytes>>> for BoundUdpProxyService<S>
+impl<ReqBody, ResBody, S> tower::Service<Request<ReqBody>> for BoundUdpProxyService<S>
 where
-    RS: h3::quic::RecvStream + Send + Sync + 'static,
-    BD: Body<Data = Bytes> + Send + 'static,
-    BD::Error: Into<h3_util::Error> + std::error::Error + Send + Sync,
-    S: tower::Service<Request<H3IncomingServer<RS, Bytes>>, Response = Response<BD>>,
+    S: tower::Service<Request<ReqBody>, Response = Response<ResBody>>,
     S::Error: Send + 'static,
     S::Future: Send + 'static,
+    ReqBody: Body<Data = Bytes> + Send + Unpin + 'static,
+    ReqBody::Error: std::error::Error + Send + Sync,
+    ResBody: Body<Data = Bytes> + Send + 'static,
+    ResBody::Error: std::error::Error + Send + Sync,
 {
     type Response = Response<axum::body::Body>;
     type Error = S::Error;
@@ -80,11 +81,16 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request<H3IncomingServer<RS, Bytes>>) -> Self::Future {
-        tracing::debug!("BoundUdpProxyService received request for {}", req.uri().path());
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
-            let proxy_state = req.extensions_mut().remove::<ProxyState>().unwrap();
-            let stream_id = req.extensions_mut().remove::<StreamId>().unwrap();
+            let Some(proxy_state) = req.extensions_mut().remove::<ProxyState>() else {
+                tracing::warn!("missing ProxyState in request extensions");
+                let res = Response::builder()
+                    .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                return Box::pin(futures::future::ready(Ok(res)));
+            };
 
             let socket = match (
                 validate_connect_udp(&req),
@@ -92,11 +98,10 @@ where
                 req.headers().get("capsule-protocol"),
             ) {
                 (true, Some(bind), Some(capsule)) if bind == "?1" && capsule == "?1" => {
-                    tracing::debug!("BoundUdpProxyService handling bound_udp_proxy");
                     std::net::UdpSocket::bind("0.0.0.0:0").unwrap()
                 }
                 _ => {
-                    tracing::debug!("BoundUdpProxyService invalid request");
+                    tracing::warn!("invalid request");
                     let res = Response::builder()
                         .status(http::StatusCode::BAD_REQUEST)
                         .body(axum::body::Body::empty())
@@ -111,30 +116,18 @@ where
                 socket.set_nonblocking(true).unwrap();
                 let socket = Arc::new(UdpSocket::from_std(socket).unwrap());
 
-                let (resp_tx, resp_rx) = oneshot::channel();
-                proxy_state.from_udp_to_quic.send(FromUdpToQuicRequest::RegisterSocket(socket.clone(), resp_tx)).await.unwrap();
-                match resp_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to register socket: {e}");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::error!("Failed to register socket");
+                match proxy_state.from_udp_to_quic.register_socket(socket.clone()).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("Failed to register socket to from_udp_to_quic: {e}");
                         return;
                     }
                 }
 
-                let (resp_tx, resp_rx) = oneshot::channel();
-                proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::RegisterSocket(stream_id, socket, resp_tx)).await.unwrap();
-                match resp_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to register socket: {e}");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::error!("Failed to register socket");
+                match proxy_state.from_quic_to_udp.register_socket(socket.clone()).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("Failed to register socket to from_quic_to_udp: {e}");
                         return;
                     }
                 }
@@ -222,30 +215,18 @@ where
                                         context_id, addr
                                     );
 
-                                    let (resp_tx, resp_rx) = oneshot::channel();
-                                    proxy_state.from_udp_to_quic.send(FromUdpToQuicRequest::RegisterContextID(context_id, addr, resp_tx)).await.unwrap();
-                                    match resp_rx.await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(e)) => {
-                                            tracing::error!("Failed to register context_id: {e}");
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            tracing::error!("Failed to register context_id");
+                                    match proxy_state.from_udp_to_quic.register_context_id(context_id, addr).await {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            tracing::error!("Failed to register context_id to from_udp_to_quic: {e}");
                                             return;
                                         }
                                     }
 
-                                    let (resp_tx, resp_rx) = oneshot::channel();
-                                    proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::RegisterContextID(stream_id, context_id, addr, resp_tx)).await.unwrap();
-                                    match resp_rx.await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(e)) => {
-                                            tracing::error!("Failed to register context_id: {e}");
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            tracing::error!("Failed to register context_id");
+                                    match proxy_state.from_quic_to_udp.register_context_id(context_id, addr).await {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            tracing::error!("Failed to register context_id to from_quic_to_udp: {e}");
                                             return;
                                         }
                                     }
@@ -269,37 +250,20 @@ where
                             }
                         }
                         Err(e) => {
-                            tracing::error!("BoundUdpProxyService receive error: {}", e);
+                            tracing::error!("receive error: {}", e);
                             break;
                         }
                     }
                 }
 
-                let (resp_tx, resp_rx) = oneshot::channel();
-                proxy_state.from_udp_to_quic.send(FromUdpToQuicRequest::Finish(resp_tx)).await.unwrap();
-                match resp_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to finish: {e}");
-                    }
-                    Err(_) => {
-                        tracing::error!("Failed to finish");
+                match proxy_state.from_udp_to_quic.finish().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("Failed to finish from_udp_to_quic: {e}");
                     }
                 }
-
-                let (resp_tx, resp_rx) = oneshot::channel();
-                proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::Finish(resp_tx)).await.unwrap();
-                match resp_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to finish: {e}");
-                    }
-                    Err(_) => {
-                        tracing::error!("Failed to finish");
-                    }
-                }
-
             });
+            tracing::info!("handling bound_udp_proxy, proxy public address is {}", proxy_public_addr);
             let res = Response::builder()
                 .status(http::StatusCode::OK)
                 .header("connect-udp-bind", "?1")
@@ -317,9 +281,9 @@ where
     }
 }
 
-fn validate_connect_udp<RS>(request: &Request<H3IncomingServer<RS, Bytes>>) -> bool
+fn validate_connect_udp<ReqBody>(request: &Request<ReqBody>) -> bool
 where
-    RS: h3::quic::RecvStream + Send + Sync + 'static,
+    ReqBody: Body<Data = Bytes> + Send + Unpin + 'static,
 {
     let protocol = request.extensions().get::<Protocol>();
     matches!((request.method(), protocol), (&http::Method::CONNECT, Some(p)) if p == &Protocol::CONNECT_UDP)
@@ -376,7 +340,7 @@ fn encode_var_int(mut v: u64) -> Vec<u8> {
 
 enum FromUdpToQuicRequest {
     RegisterSocket(Arc<UdpSocket>, oneshot::Sender<anyhow::Result<()>>),
-    RegisterContextID(u64, Option<SocketAddr>, oneshot::Sender<anyhow::Result<()>>),
+    RegisterContextId(u64, Option<SocketAddr>, oneshot::Sender<anyhow::Result<()>>),
     Finish(oneshot::Sender<anyhow::Result<()>>),
 }
 
@@ -386,19 +350,115 @@ enum FromQuicToUdpRequest {
         Arc<UdpSocket>,
         oneshot::Sender<anyhow::Result<()>>,
     ),
-    RegisterContextID(
+    RegisterContextId(
         StreamId,
         u64,
         Option<SocketAddr>,
         oneshot::Sender<anyhow::Result<()>>,
     ),
-    Finish(oneshot::Sender<anyhow::Result<()>>),
+}
+
+#[derive(Clone)]
+struct FromUdpToQuicController {
+    tx: mpsc::Sender<FromUdpToQuicRequest>,
+}
+
+#[derive(Clone)]
+struct FromQuicToUdpController {
+    stream_id: StreamId,
+    tx: mpsc::Sender<FromQuicToUdpRequest>,
+}
+
+impl FromUdpToQuicController {
+    fn new(tx: mpsc::Sender<FromUdpToQuicRequest>) -> Self {
+        Self { tx }
+    }
+
+    async fn register_socket(&self, socket: Arc<UdpSocket>) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(FromUdpToQuicRequest::RegisterSocket(socket, resp_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send RegisterSocket request"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterSocket response"))?
+    }
+
+    async fn register_context_id(
+        &self,
+        context_id: u64,
+        addr: Option<SocketAddr>,
+    ) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(FromUdpToQuicRequest::RegisterContextId(
+                context_id, addr, resp_tx,
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send RegisterContextId request"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterContextId response"))?
+    }
+
+    async fn finish(&self) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(FromUdpToQuicRequest::Finish(resp_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send Finish request"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive Finish response"))?
+    }
+}
+
+impl FromQuicToUdpController {
+    fn new(stream_id: StreamId, tx: mpsc::Sender<FromQuicToUdpRequest>) -> Self {
+        Self { stream_id, tx }
+    }
+
+    async fn register_socket(&self, socket: Arc<UdpSocket>) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(FromQuicToUdpRequest::RegisterSocket(
+                self.stream_id,
+                socket,
+                resp_tx,
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send RegisterSocket request"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterSocket response"))?
+    }
+
+    async fn register_context_id(
+        &self,
+        context_id: u64,
+        addr: Option<SocketAddr>,
+    ) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(FromQuicToUdpRequest::RegisterContextId(
+                self.stream_id,
+                context_id,
+                addr,
+                resp_tx,
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send RegisterContextId request"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterContextId response"))?
+    }
 }
 
 #[derive(Clone)]
 struct ProxyState {
-    from_udp_to_quic: mpsc::Sender<FromUdpToQuicRequest>,
-    from_quic_to_udp: mpsc::Sender<FromQuicToUdpRequest>,
+    from_udp_to_quic: FromUdpToQuicController,
+    from_quic_to_udp: FromQuicToUdpController,
 }
 
 /// Accept each connection from acceptor, then for each connection
@@ -508,16 +568,19 @@ where
                 let from_quic_to_udp_tx2 = from_quic_to_udp_tx.clone();
                 executor_clone.execute(async move {
                     if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
-                        tracing::debug!("received request for bound_udp_proxy");
-                        let (tx, rx) = mpsc::channel(1024);
+                        let (from_udp_to_quic_tx, from_udp_to_quic_rx) = mpsc::channel(1024);
                         let state = ProxyState {
-                            from_udp_to_quic: tx,
-                            from_quic_to_udp: from_quic_to_udp_tx2,
+                            from_udp_to_quic: FromUdpToQuicController::new(from_udp_to_quic_tx),
+                            from_quic_to_udp: FromQuicToUdpController::new(
+                                stream_id,
+                                from_quic_to_udp_tx2,
+                            ),
                         };
                         req.extensions_mut().insert(state);
-                        req.extensions_mut().insert(stream_id);
                         executor_clone2.execute(async move {
-                            from_udp_to_quic_thread(rx, datagram_sender).await.unwrap();
+                            from_udp_to_quic_thread(from_udp_to_quic_rx, datagram_sender)
+                                .await
+                                .unwrap();
                         });
                     } else {
                         tracing::debug!("received request for {}", req.uri().path());
@@ -633,15 +696,10 @@ where
                         socket_info.insert(stream_id, socket);
                         resp_tx.send(anyhow::Ok(())).unwrap();
                     }
-                    Some(FromQuicToUdpRequest::RegisterContextID(stream_id, context_id, addr, resp_tx)) => {
+                    Some(FromQuicToUdpRequest::RegisterContextId(stream_id, context_id, addr, resp_tx)) => {
                         tracing::debug!("from_quic_to_udp_thread received RegisterContextID request for stream id {}, context id {}, addr {:?}", stream_id, context_id, addr);
                         compression_info.insert((stream_id, context_id), addr);
                         resp_tx.send(anyhow::Ok(())).unwrap();
-                    }
-                    Some(FromQuicToUdpRequest::Finish(resp_tx)) => {
-                        tracing::info!("from_quic_to_udp_thread received Finish request, exiting");
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                        return Ok(());
                     }
                     None => {
                         tracing::debug!("from_quic_to_udp_thread channel closed");
@@ -688,7 +746,7 @@ where
                         tracing::debug!("from_udp_to_quic_thread received unexpected RegisterSocket request");
                         resp_tx.send(Err(anyhow::anyhow!("unexpected RegisterSocket request"))).unwrap();
                     }
-                    Some(FromUdpToQuicRequest::RegisterContextID(context_id, addr, resp_tx)) => {
+                    Some(FromUdpToQuicRequest::RegisterContextId(context_id, addr, resp_tx)) => {
                         if let Some(addr) = addr {
                             compression_info.insert(addr, context_id);
                             tracing::info!("registered compressed context id {} for addr {}", context_id, addr);
