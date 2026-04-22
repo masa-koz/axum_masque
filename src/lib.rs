@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    future::{Future, poll_fn},
-};
+use std::{collections::HashMap, future::Future};
 
 use axum::body::Bytes;
 use bytes::{Buf, BufMut, BytesMut};
@@ -29,6 +26,12 @@ pub struct BoundUdpProxyLayer;
 impl BoundUdpProxyLayer {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for BoundUdpProxyLayer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -78,6 +81,7 @@ where
     }
 
     fn call(&mut self, mut req: Request<H3IncomingServer<RS, Bytes>>) -> Self::Future {
+        tracing::debug!("BoundUdpProxyService received request for {}", req.uri().path());
         if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
             let proxy_state = req.extensions_mut().remove::<ProxyState>().unwrap();
             let stream_id = req.extensions_mut().remove::<StreamId>().unwrap();
@@ -122,7 +126,7 @@ where
                 }
 
                 let (resp_tx, resp_rx) = oneshot::channel();
-                proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::RegisterSocket(stream_id.clone(), socket, resp_tx)).await.unwrap();
+                proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::RegisterSocket(stream_id, socket, resp_tx)).await.unwrap();
                 match resp_rx.await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -161,7 +165,7 @@ where
                                         buf.advance(length as usize);
                                         continue;
                                     };
-                                    if payload.len() < 1 {
+                                    if payload.is_empty() {
                                         buf.advance(length as usize);
                                         continue;
                                     }
@@ -183,15 +187,8 @@ where
                                                 buf.advance((length) as usize);
                                                 continue;
                                             }
-                                            let ip_bytes = &payload[..4];
-                                            let port_bytes = &payload[4..6];
-                                            let ip = std::net::Ipv4Addr::new(
-                                                ip_bytes[0],
-                                                ip_bytes[1],
-                                                ip_bytes[2],
-                                                ip_bytes[3],
-                                            );
-                                            let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+                                            let ip = std::net::Ipv4Addr::from_octets(<[u8; 4]>::try_from(&payload[..4]).unwrap());
+                                            let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[4..6]).unwrap());
                                             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
                                             Some(addr)
                                         }
@@ -204,27 +201,8 @@ where
                                                 buf.advance((length) as usize);
                                                 continue;
                                             }
-                                            let ip_bytes = &payload[..16];
-                                            let port_bytes = &payload[16..18];
-                                            let ip = std::net::Ipv6Addr::from([
-                                                ip_bytes[0],
-                                                ip_bytes[1],
-                                                ip_bytes[2],
-                                                ip_bytes[3],
-                                                ip_bytes[4],
-                                                ip_bytes[5],
-                                                ip_bytes[6],
-                                                ip_bytes[7],
-                                                ip_bytes[8],
-                                                ip_bytes[9],
-                                                ip_bytes[10],
-                                                ip_bytes[11],
-                                                ip_bytes[12],
-                                                ip_bytes[13],
-                                                ip_bytes[14],
-                                                ip_bytes[15],
-                                            ]);
-                                            let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+                                            let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&payload[..16]).unwrap());
+                                            let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[16..18]).unwrap());
                                             let addr = SocketAddr::new(std::net::IpAddr::V6(ip), port);
                                             Some(addr)
                                         }
@@ -259,7 +237,7 @@ where
                                     }
 
                                     let (resp_tx, resp_rx) = oneshot::channel();
-                                    proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::RegisterContextID(stream_id.clone(), context_id, addr, resp_tx)).await.unwrap();
+                                    proxy_state.from_quic_to_udp.send(FromQuicToUdpRequest::RegisterContextID(stream_id, context_id, addr, resp_tx)).await.unwrap();
                                     match resp_rx.await {
                                         Ok(Ok(())) => {}
                                         Ok(Err(e)) => {
@@ -303,11 +281,9 @@ where
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::error!("Failed to finish: {e}");
-                        return;
                     }
                     Err(_) => {
                         tracing::error!("Failed to finish");
-                        return;
                     }
                 }
 
@@ -317,11 +293,9 @@ where
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::error!("Failed to finish: {e}");
-                        return;
                     }
                     Err(_) => {
                         tracing::error!("Failed to finish");
-                        return;
                     }
                 }
 
@@ -363,9 +337,9 @@ fn decode_var_int(data: &[u8]) -> Option<(u64, &[u8])> {
     }
     // Once the length is known, remove these bits and read any
     // remaining bytes.
-    v = v & 0x3f;
-    for i in 1..length - 1 {
-        v = (v << 8) + Into::<u64>::into(data[i]);
+    v &= 0x3f;
+    for v1 in data.iter().take(length).skip(1) {
+        v = (v << 8) + Into::<u64>::into(*v1);
     }
 
     Some((v, &data[length..]))
@@ -586,9 +560,9 @@ where
                             continue;
                         };
                         let addr = match compression_info.get(&(stream_id, context_id)) {
-                            Some(Some(addr)) => addr.clone(),
+                            Some(Some(addr)) => *addr,
                             Some(None) => {
-                                if payload.len() < 1 {
+                                if payload.is_empty() {
                                     tracing::error!(
                                         "missing IP version byte in datagram with context id {}",
                                         context_id
@@ -605,15 +579,8 @@ where
                                             );
                                             continue;
                                         }
-                                        let ip_bytes = &payload[..4];
-                                        let port_bytes = &payload[4..6];
-                                        let ip = std::net::Ipv4Addr::new(
-                                            ip_bytes[0],
-                                            ip_bytes[1],
-                                            ip_bytes[2],
-                                            ip_bytes[3],
-                                        );
-                                        let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+                                        let ip = std::net::Ipv4Addr::from_octets(<[u8; 4]>::try_from(&payload[..4]).unwrap());
+                                        let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[4..6]).unwrap());
                                         let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
                                         tracing::info!("context id {} target {}", context_id, addr);
                                         payload.advance(6);
@@ -627,27 +594,8 @@ where
                                             );
                                             continue;
                                         }
-                                        let ip_bytes = &payload[..16];
-                                        let port_bytes = &payload[16..18];
-                                        let ip = std::net::Ipv6Addr::from([
-                                            ip_bytes[0],
-                                            ip_bytes[1],
-                                            ip_bytes[2],
-                                            ip_bytes[3],
-                                            ip_bytes[4],
-                                            ip_bytes[5],
-                                            ip_bytes[6],
-                                            ip_bytes[7],
-                                            ip_bytes[8],
-                                            ip_bytes[9],
-                                            ip_bytes[10],
-                                            ip_bytes[11],
-                                            ip_bytes[12],
-                                            ip_bytes[13],
-                                            ip_bytes[14],
-                                            ip_bytes[15],
-                                        ]);
-                                        let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+                                        let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&payload[..16]).unwrap());
+                                        let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[16..18]).unwrap());
                                         let addr = SocketAddr::new(std::net::IpAddr::V6(ip), port);
                                         tracing::info!("context id {} target {}", context_id, addr);
                                         payload.advance(18);
