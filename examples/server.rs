@@ -63,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = listener.local_addr()?;
     tracing::debug!("listenaddr : {}", listen_addr);
     let acceptor = H3MsQuicAsyncAcceptor::new(listener);
-    let router = Router::new().route("/", axum::routing::get(|| async { "Hello, World!" }));
+    let router = Router::new().route("/", axum::routing::get(|| async { "Hello, World!" }))
+        .layer(axum_masque::bound_udp::BoundUdpLayer::new());
 
     let token_cloned = token.clone();
     let handle_svc = tokio::spawn(async move {

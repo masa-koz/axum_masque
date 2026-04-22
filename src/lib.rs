@@ -1,287 +1,25 @@
-use std::{collections::HashMap, future::Future};
-
 use axum::body::Bytes;
-use bytes::{Buf, BufMut, BytesMut};
-use h3::{ext::Protocol, quic::StreamId};
+use h3::ext::Protocol;
 use h3_datagram::{
-    datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
-    quic_traits::{DatagramConnectionExt, RecvDatagram, SendDatagram},
+    datagram_handler::HandleDatagramsExt,
+    quic_traits::{DatagramConnectionExt, RecvDatagram},
 };
 use h3_util::{server::H3Acceptor, server_body::H3IncomingServer};
 use http::{Request, Response};
 use http_body::Body;
-use http_body_util::{BodyExt, channel::Channel};
 use hyper::rt::Executor;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
-use tokio::{net::UdpSocket, sync::mpsc, sync::oneshot};
-use tower::layer::Layer;
+use std::future::Future;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "msquic-async")]
 pub mod msquic_async {
     pub use h3_util::msquic_async::*;
 }
 
-pub struct BoundUdpProxyLayer;
+pub mod bound_udp;
+mod masque;
 
-impl BoundUdpProxyLayer {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for BoundUdpProxyLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<S> Layer<S> for BoundUdpProxyLayer {
-    type Service = BoundUdpProxyService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        BoundUdpProxyService::new(inner)
-    }
-}
-
-#[derive(Clone)]
-pub struct BoundUdpProxyService<S> {
-    inner: S,
-    executor: h3_util::executor::SharedExec,
-}
-
-impl<S> BoundUdpProxyService<S> {
-    pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            executor: h3_util::executor::SharedExec::tokio(),
-        }
-    }
-}
-
-impl<ReqBody, ResBody, S> tower::Service<Request<ReqBody>> for BoundUdpProxyService<S>
-where
-    S: tower::Service<Request<ReqBody>, Response = Response<ResBody>>,
-    S::Error: Send + 'static,
-    S::Future: Send + 'static,
-    ReqBody: Body<Data = Bytes> + Send + Unpin + 'static,
-    ReqBody::Error: std::error::Error + Send + Sync,
-    ResBody: Body<Data = Bytes> + Send + 'static,
-    ResBody::Error: std::error::Error + Send + Sync,
-{
-    type Response = Response<axum::body::Body>;
-    type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
-    >;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
-        if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
-            let Some(proxy_state) = req.extensions_mut().remove::<ProxyState>() else {
-                tracing::warn!("missing ProxyState in request extensions");
-                let res = Response::builder()
-                    .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-                return Box::pin(futures::future::ready(Ok(res)));
-            };
-
-            let socket = match (
-                validate_connect_udp(&req),
-                req.headers().get("connect-udp-bind"),
-                req.headers().get("capsule-protocol"),
-            ) {
-                (true, Some(bind), Some(capsule)) if bind == "?1" && capsule == "?1" => {
-                    std::net::UdpSocket::bind("0.0.0.0:0").unwrap()
-                }
-                _ => {
-                    tracing::warn!("invalid request");
-                    let res = Response::builder()
-                        .status(http::StatusCode::BAD_REQUEST)
-                        .body(axum::body::Body::empty())
-                        .unwrap();
-                    return Box::pin(futures::future::ready(Ok(res)));
-                }
-            };
-            let proxy_public_addr = socket.local_addr().unwrap();
-            let (mut tx, res_body) = Channel::<Bytes, Infallible>::new(4);
-            self.executor.execute(async move {
-                let (_, mut req_body) = req.into_parts();
-                socket.set_nonblocking(true).unwrap();
-                let socket = Arc::new(UdpSocket::from_std(socket).unwrap());
-
-                match proxy_state.from_udp_to_quic.register_socket(socket.clone()).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!("Failed to register socket to from_udp_to_quic: {e}");
-                        return;
-                    }
-                }
-
-                match proxy_state.from_quic_to_udp.register_socket(socket.clone()).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!("Failed to register socket to from_quic_to_udp: {e}");
-                        return;
-                    }
-                }
-
-                let mut buf = BytesMut::new();
-                while let Some(chunk) = req_body.frame().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            let bytes = bytes.into_data().unwrap();
-                            buf.extend_from_slice(&bytes);
-                            let Some((capsule_type, payload)) = crate::decode_var_int(buf.chunk()) else {
-                                // incomplete capsule
-                                continue;
-                            };
-                            let Some((length, payload)) = crate::decode_var_int(payload) else {
-                                // incomplete capsule
-                                continue;
-                            };
-                            if buf.len() < length as usize {
-                                // incomplete capsule
-                                continue;
-                            }
-                            match capsule_type {
-                                0x11 => {
-                                    // COMPRESSION_ASSIGN capsule
-                                    let Some((context_id, mut payload)) = crate::decode_var_int(payload)
-                                    else {
-                                        buf.advance(length as usize);
-                                        continue;
-                                    };
-                                    if payload.is_empty() {
-                                        buf.advance(length as usize);
-                                        continue;
-                                    }
-                                    let ip_version = payload.get_u8();
-                                    let addr = match ip_version {
-                                        0 => {
-                                            tracing::info!(
-                                                "received COMPRESSION_ASSIGN capsule with context id {}",
-                                                context_id
-                                            );
-                                            None
-                                        }
-                                        4 => {
-                                            if payload.len() < 6 {
-                                                tracing::error!(
-                                                    "missing IPv4 address and port in COMPRESSION_ASSIGN capsule: context id {}",
-                                                    context_id
-                                                );
-                                                buf.advance((length) as usize);
-                                                continue;
-                                            }
-                                            let ip = std::net::Ipv4Addr::from_octets(<[u8; 4]>::try_from(&payload[..4]).unwrap());
-                                            let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[4..6]).unwrap());
-                                            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-                                            Some(addr)
-                                        }
-                                        6 => {
-                                            if payload.len() < 18 {
-                                                tracing::error!(
-                                                    "missing IPv6 address and port in COMPRESSION_ASSIGN capsule: context id {}",
-                                                    context_id
-                                                );
-                                                buf.advance((length) as usize);
-                                                continue;
-                                            }
-                                            let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&payload[..16]).unwrap());
-                                            let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[16..18]).unwrap());
-                                            let addr = SocketAddr::new(std::net::IpAddr::V6(ip), port);
-                                            Some(addr)
-                                        }
-                                        _ => {
-                                            tracing::error!(
-                                                "unknown IP version in COMPRESSION_ASSIGN capsule: {}",
-                                                ip_version
-                                            );
-                                            buf.advance((length) as usize);
-                                            continue;
-                                        }
-                                    };
-                                    buf.advance((length) as usize);
-
-                                    tracing::info!(
-                                        "received COMPRESSION_ASSIGN capsule: context id {}, addr {:?}",
-                                        context_id, addr
-                                    );
-
-                                    match proxy_state.from_udp_to_quic.register_context_id(context_id, addr).await {
-                                        Ok(()) => {}
-                                        Err(e) => {
-                                            tracing::error!("Failed to register context_id to from_udp_to_quic: {e}");
-                                            return;
-                                        }
-                                    }
-
-                                    match proxy_state.from_quic_to_udp.register_context_id(context_id, addr).await {
-                                        Ok(()) => {}
-                                        Err(e) => {
-                                            tracing::error!("Failed to register context_id to from_quic_to_udp: {e}");
-                                            return;
-                                        }
-                                    }
-
-                                    let mut resp_buf = BytesMut::new();
-                                    let resp_length = crate::encode_var_int(0x12).len()
-                                        + 1
-                                        + crate::encode_var_int(context_id).len();
-                                    resp_buf.extend_from_slice(
-                                        &crate::encode_var_int(0x12), // COMPRESSION_ACK capsule
-                                    );
-                                    resp_buf.extend_from_slice(&crate::encode_var_int(resp_length as u64));
-                                    resp_buf.extend_from_slice(&crate::encode_var_int(context_id));
-                                    tx.send(http_body::Frame::data(resp_buf.freeze())).await.unwrap();
-                                }
-                                _ => {
-                                    tracing::error!("unknown capsule type {}", capsule_type);
-                                    buf.advance(length as usize);
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("receive error: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                match proxy_state.from_udp_to_quic.finish().await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!("Failed to finish from_udp_to_quic: {e}");
-                    }
-                }
-            });
-            tracing::info!("handling bound_udp_proxy, proxy public address is {}", proxy_public_addr);
-            let res = Response::builder()
-                .status(http::StatusCode::OK)
-                .header("connect-udp-bind", "?1")
-                .header("capsule-protocol", "?1")
-                .header("proxy-public-address", format!("{}", proxy_public_addr))
-                .body(axum::body::Body::new(res_body))
-                .unwrap();
-            return Box::pin(futures::future::ready(Ok(res)));
-        }
-        let fut = self.inner.call(req);
-        Box::pin(async move {
-            let res = fut.await?;
-            Ok(res.map(axum::body::Body::new))
-        })
-    }
-}
-
-fn validate_connect_udp<ReqBody>(request: &Request<ReqBody>) -> bool
+pub(crate) fn validate_connect_udp<ReqBody>(request: &Request<ReqBody>) -> bool
 where
     ReqBody: Body<Data = Bytes> + Send + Unpin + 'static,
 {
@@ -289,7 +27,7 @@ where
     matches!((request.method(), protocol), (&http::Method::CONNECT, Some(p)) if p == &Protocol::CONNECT_UDP)
 }
 
-fn decode_var_int(data: &[u8]) -> Option<(u64, &[u8])> {
+pub(crate) fn decode_var_int(data: &[u8]) -> Option<(u64, &[u8])> {
     // The length of variable-length integers is encoded in the
     // first two bits of the first byte.
     let mut v: u64 = data[0].into();
@@ -309,7 +47,7 @@ fn decode_var_int(data: &[u8]) -> Option<(u64, &[u8])> {
     Some((v, &data[length..]))
 }
 
-fn encode_var_int(mut v: u64) -> Vec<u8> {
+pub(crate) fn encode_var_int(mut v: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     let length = if v < 0x40 {
         1
@@ -338,129 +76,6 @@ fn encode_var_int(mut v: u64) -> Vec<u8> {
     buf
 }
 
-enum FromUdpToQuicRequest {
-    RegisterSocket(Arc<UdpSocket>, oneshot::Sender<anyhow::Result<()>>),
-    RegisterContextId(u64, Option<SocketAddr>, oneshot::Sender<anyhow::Result<()>>),
-    Finish(oneshot::Sender<anyhow::Result<()>>),
-}
-
-enum FromQuicToUdpRequest {
-    RegisterSocket(
-        StreamId,
-        Arc<UdpSocket>,
-        oneshot::Sender<anyhow::Result<()>>,
-    ),
-    RegisterContextId(
-        StreamId,
-        u64,
-        Option<SocketAddr>,
-        oneshot::Sender<anyhow::Result<()>>,
-    ),
-}
-
-#[derive(Clone)]
-struct FromUdpToQuicController {
-    tx: mpsc::Sender<FromUdpToQuicRequest>,
-}
-
-#[derive(Clone)]
-struct FromQuicToUdpController {
-    stream_id: StreamId,
-    tx: mpsc::Sender<FromQuicToUdpRequest>,
-}
-
-impl FromUdpToQuicController {
-    fn new(tx: mpsc::Sender<FromUdpToQuicRequest>) -> Self {
-        Self { tx }
-    }
-
-    async fn register_socket(&self, socket: Arc<UdpSocket>) -> anyhow::Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(FromUdpToQuicRequest::RegisterSocket(socket, resp_tx))
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to send RegisterSocket request"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterSocket response"))?
-    }
-
-    async fn register_context_id(
-        &self,
-        context_id: u64,
-        addr: Option<SocketAddr>,
-    ) -> anyhow::Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(FromUdpToQuicRequest::RegisterContextId(
-                context_id, addr, resp_tx,
-            ))
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to send RegisterContextId request"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterContextId response"))?
-    }
-
-    async fn finish(&self) -> anyhow::Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(FromUdpToQuicRequest::Finish(resp_tx))
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to send Finish request"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to receive Finish response"))?
-    }
-}
-
-impl FromQuicToUdpController {
-    fn new(stream_id: StreamId, tx: mpsc::Sender<FromQuicToUdpRequest>) -> Self {
-        Self { stream_id, tx }
-    }
-
-    async fn register_socket(&self, socket: Arc<UdpSocket>) -> anyhow::Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(FromQuicToUdpRequest::RegisterSocket(
-                self.stream_id,
-                socket,
-                resp_tx,
-            ))
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to send RegisterSocket request"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterSocket response"))?
-    }
-
-    async fn register_context_id(
-        &self,
-        context_id: u64,
-        addr: Option<SocketAddr>,
-    ) -> anyhow::Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(FromQuicToUdpRequest::RegisterContextId(
-                self.stream_id,
-                context_id,
-                addr,
-                resp_tx,
-            ))
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to send RegisterContextId request"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to receive RegisterContextId response"))?
-    }
-}
-
-#[derive(Clone)]
-struct ProxyState {
-    from_udp_to_quic: FromUdpToQuicController,
-    from_quic_to_udp: FromQuicToUdpController,
-}
-
 /// Accept each connection from acceptor, then for each connection
 /// accept each request. Spawn a task to handle each request.
 async fn serve_inner<AC, F>(
@@ -478,19 +93,7 @@ where
     AC::RS: Sync,
     F: Future<Output = ()>,
 {
-    let svc = tower::ServiceBuilder::new()
-        //.add_extension(Arc::new(ConnInfo { addr, certificates }))
-        .layer(BoundUdpProxyLayer::new())
-        .service(svc);
-
-    // TODO: tonic body is wrapped? Is it for error to status conversion?
-    // use tower::ServiceExt;
-    // let h_svc =
-    //     hyper_util::service::TowerToHyperService::new(svc.map_request(|req: http::Request<_>| {
-    //         req.map(tonic::body::boxed::<crate::H3IncomingServer<AC::RS, Bytes>>)
-    //     }));
-
-    // let h_svc = hyper_util::service::TowerToHyperService::new(svc);
+    let svc = tower::ServiceBuilder::new().service(svc);
 
     let mut sig = std::pin::pin!(signal);
     tracing::trace!("loop start");
@@ -532,7 +135,7 @@ where
             let (from_quic_to_udp_tx, from_quic_to_udp_rx) = mpsc::channel(1024);
             let datagram_reader = conn.get_datagram_reader();
             executor_clone.execute(async move {
-                from_quic_to_udp_thread(from_quic_to_udp_rx, datagram_reader)
+                crate::masque::from_quic_to_udp::thread(from_quic_to_udp_rx, datagram_reader)
                     .await
                     .unwrap();
             });
@@ -569,16 +172,16 @@ where
                 executor_clone.execute(async move {
                     if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
                         let (from_udp_to_quic_tx, from_udp_to_quic_rx) = mpsc::channel(1024);
-                        let state = ProxyState {
-                            from_udp_to_quic: FromUdpToQuicController::new(from_udp_to_quic_tx),
-                            from_quic_to_udp: FromQuicToUdpController::new(
+                        let state = crate::masque::ProxyState {
+                            from_udp_to_quic: crate::masque::from_udp_to_quic::Controller::new(from_udp_to_quic_tx),
+                            from_quic_to_udp: crate::masque::from_quic_to_udp::Controller::new(
                                 stream_id,
                                 from_quic_to_udp_tx2,
                             ),
                         };
                         req.extensions_mut().insert(state);
                         executor_clone2.execute(async move {
-                            from_udp_to_quic_thread(from_udp_to_quic_rx, datagram_sender)
+                            crate::masque::from_udp_to_quic::thread(from_udp_to_quic_rx, datagram_sender)
                                 .await
                                 .unwrap();
                         });
@@ -592,225 +195,6 @@ where
             }
         });
     }
-}
-
-async fn from_quic_to_udp_thread<H>(
-    mut rx: mpsc::Receiver<FromQuicToUdpRequest>,
-    mut datagram_reader: DatagramReader<H>,
-) -> anyhow::Result<()>
-where
-    H: RecvDatagram + 'static + Send,
-    <H as RecvDatagram>::Buffer: Send,
-{
-    let mut socket_info: HashMap<StreamId, Arc<UdpSocket>> = HashMap::new();
-    let mut compression_info: HashMap<(StreamId, u64), Option<SocketAddr>> = HashMap::new();
-    loop {
-        tokio::select! {
-            datagram = datagram_reader.read_datagram() => {
-                let datagram = match datagram {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::error!("recv datagram error: {}", e);
-                        break;
-                    }
-                };
-                let stream_id = datagram.stream_id();
-                let datagram = datagram.into_payload();
-                if let Some((context_id, mut payload)) = decode_var_int(datagram.chunk()) {
-                    let (socket, addr) = {
-                        let Some(socket) = socket_info.get(&stream_id) else {
-                            tracing::error!("unknown stream id {}", stream_id);
-                            continue;
-                        };
-                        let addr = match compression_info.get(&(stream_id, context_id)) {
-                            Some(Some(addr)) => *addr,
-                            Some(None) => {
-                                if payload.is_empty() {
-                                    tracing::error!(
-                                        "missing IP version byte in datagram with context id {}",
-                                        context_id
-                                    );
-                                    continue;
-                                }
-                                let ip_version = payload.get_u8();
-                                match ip_version {
-                                    4 => {
-                                        if payload.len() < 6 {
-                                            tracing::error!(
-                                                "missing IPv4 address and port in datagram with context id {}",
-                                                context_id
-                                            );
-                                            continue;
-                                        }
-                                        let ip = std::net::Ipv4Addr::from_octets(<[u8; 4]>::try_from(&payload[..4]).unwrap());
-                                        let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[4..6]).unwrap());
-                                        let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-                                        tracing::info!("context id {} target {}", context_id, addr);
-                                        payload.advance(6);
-                                        addr
-                                    }
-                                    6 => {
-                                        if payload.len() < 18 {
-                                            tracing::error!(
-                                                "missing IPv6 address and port in datagram with context id {}",
-                                                context_id
-                                            );
-                                            continue;
-                                        }
-                                        let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&payload[..16]).unwrap());
-                                        let port = u16::from_be_bytes(<[u8; 2]>::try_from(&payload[16..18]).unwrap());
-                                        let addr = SocketAddr::new(std::net::IpAddr::V6(ip), port);
-                                        tracing::info!("context id {} target {}", context_id, addr);
-                                        payload.advance(18);
-                                        addr
-                                    }
-                                    _ => {
-                                        tracing::error!(
-                                            "unknown IP version {} in datagram with context id {}",
-                                            ip_version, context_id
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            None => {
-                                tracing::error!("unknown context id {}", context_id);
-                                continue;
-                            }
-                        };
-                        (socket.clone(), addr)
-                    };
-                    if let Err(err) = socket.send_to(payload, addr).await {
-                        tracing::error!("failed to send datagram: {:?}", err);
-                        continue;
-                    }
-                } else {
-                    tracing::error!("failed to decode var int from datagram");
-                    continue;
-                }
-            }
-            req = rx.recv() => {
-                match req {
-                    Some(FromQuicToUdpRequest::RegisterSocket(stream_id, socket, resp_tx)) => {
-                        tracing::debug!("from_quic_to_udp_thread received RegisterSocket request for stream id {}", stream_id);
-                        socket_info.insert(stream_id, socket);
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                    }
-                    Some(FromQuicToUdpRequest::RegisterContextId(stream_id, context_id, addr, resp_tx)) => {
-                        tracing::debug!("from_quic_to_udp_thread received RegisterContextID request for stream id {}, context id {}, addr {:?}", stream_id, context_id, addr);
-                        compression_info.insert((stream_id, context_id), addr);
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                    }
-                    None => {
-                        tracing::debug!("from_quic_to_udp_thread channel closed");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-    anyhow::Ok(())
-}
-
-async fn from_udp_to_quic_thread<H>(
-    mut rx: mpsc::Receiver<FromUdpToQuicRequest>,
-    mut datagram_sender: DatagramSender<H, Bytes>,
-) -> anyhow::Result<()>
-where
-    H: SendDatagram<Bytes> + 'static + Send,
-{
-    let socket = match rx.recv().await {
-        Some(FromUdpToQuicRequest::RegisterSocket(socket, resp_tx)) => {
-            tracing::debug!("from_udp_to_quic_thread received RegisterSocket request");
-            resp_tx.send(anyhow::Ok(())).unwrap();
-            socket
-        }
-        Some(_) => {
-            tracing::debug!("from_udp_to_quic_thread received unknown request");
-            return Ok(());
-        }
-        None => {
-            tracing::debug!("from_udp_to_quic_thread channel closed");
-            return Ok(());
-        }
-    };
-
-    let mut uncompressed_context_id = None;
-    let mut compression_info = HashMap::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        tokio::select! {
-            req = rx.recv() => {
-                match req {
-                    Some(FromUdpToQuicRequest::RegisterSocket(_, resp_tx)) => {
-                        tracing::debug!("from_udp_to_quic_thread received unexpected RegisterSocket request");
-                        resp_tx.send(Err(anyhow::anyhow!("unexpected RegisterSocket request"))).unwrap();
-                    }
-                    Some(FromUdpToQuicRequest::RegisterContextId(context_id, addr, resp_tx)) => {
-                        if let Some(addr) = addr {
-                            compression_info.insert(addr, context_id);
-                            tracing::info!("registered compressed context id {} for addr {}", context_id, addr);
-                        } else {
-                            uncompressed_context_id = Some(context_id);
-                            tracing::info!("registered uncompressed context id {}", context_id);
-                        }
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                    }
-                    Some(FromUdpToQuicRequest::Finish(resp_tx)) => {
-                        tracing::info!("from_udp_to_quic_thread received Finish request, exiting");
-                        resp_tx.send(anyhow::Ok(())).unwrap();
-                        return Ok(());
-                    }
-                    None => {
-                        tracing::debug!("from_udp_to_quic_thread channel closed");
-                        return Ok(());
-                    }
-                }
-            }
-            res = socket.recv_from(&mut buf) => {
-                let (len, addr) = match res {
-                    Ok(res) => res,
-                    Err(e) => {
-                        tracing::error!("udp receive error: {}", e);
-                        break;
-                    }
-                };
-                let (context_id, compressed) = {
-                    match compression_info.get(&addr) {
-                        Some(id) => (*id, true),
-                        None => match uncompressed_context_id {
-                            Some(id) => (id, false),
-                            None => {
-                                tracing::error!("no context id for uncompressed");
-                                continue;
-                            }
-                        },
-                    }
-                };
-                let mut datagram = BytesMut::new();
-                datagram.extend_from_slice(&crate::encode_var_int(context_id));
-                if !compressed {
-                    match addr.ip() {
-                        std::net::IpAddr::V4(ipv4) => {
-                            datagram.put_u8(4); // IP version
-                            datagram.extend_from_slice(&ipv4.octets());
-                        }
-                        std::net::IpAddr::V6(ipv6) => {
-                            datagram.put_u8(6); // IP version
-                            datagram.extend_from_slice(&ipv6.octets());
-                        }
-                    }
-                    datagram.extend_from_slice(&addr.port().to_be_bytes());
-                }
-                datagram.extend_from_slice(&buf[..len]);
-
-                if let Err(e) = datagram_sender.send_datagram(datagram.freeze()) {
-                    tracing::warn!("send datagram error: {}", e);
-                }
-            }
-        }
-    }
-    anyhow::Ok(())
 }
 
 async fn serve_request<AC, SVC, BD>(
