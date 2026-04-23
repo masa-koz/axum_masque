@@ -9,7 +9,7 @@ msquic-async = ["h3-util/msquic-async"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["macros"] }
 bytes = "1"
 futures = "0.3"
 h3 = "0.0.8"
@@ -31,6 +31,7 @@ argh = "0.1.10"
 async-trait = "0.1.77"
 jsonwebtoken = "10.3.0"
 jwks = "0.5.3"
+rand = "0.8.4"
 tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tempfile = "3"
 thiserror = "2.0.16"
