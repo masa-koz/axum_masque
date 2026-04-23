@@ -1,14 +1,19 @@
 use async_trait::async_trait;
-use axum::Router;
+use axum::{Router, body::Bytes, http::header};
 use axum_masque::H3Router;
 use axum_masque::msquic_async::{
     H3MsQuicAsyncAcceptor,
     h3_msquic_async::{msquic, msquic_async},
 };
 use jwks::Jwks;
-use std::{io::Write, net::SocketAddr, sync::Arc};
+use std::{io::Write, net::SocketAddr, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
+use tower_http::{
+    LatencyUnit, ServiceBuilderExt,
+    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+};
 use tower_jwt::{DecodingKey, DecodingKeyFn, JwtLayer, Validation};
 
 fn make_msquic_async_listner(
@@ -107,22 +112,37 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("listenaddr : {}", listen_addr);
     let acceptor = H3MsQuicAsyncAcceptor::new(listener);
 
+    let sensitive_headers: Arc<[_]> = vec![header::AUTHORIZATION, header::COOKIE].into();
+
     let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["https://seera-networks.jp.auth0.com/"]);
     validation.set_audience(&[
         "https://masque.seera-networks.com/",
         "https://seera-networks.jp.auth0.com/userinfo",
     ]);
-    let router = Router::new()
-        .route("/", axum::routing::get(|| async { "Hello, World!" }))
-        .layer(axum_masque::bound_udp::BoundUdpLayer::new())
+
+    let middleware = ServiceBuilder::new()
+        .sensitive_request_headers(sensitive_headers.clone())
+        .layer(
+            TraceLayer::new_for_http()
+                .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
+                    tracing::trace!(size_bytes = chunk.len(), latency = ?latency, "sending body chunk")
+                })
+                .make_span_with(DefaultMakeSpan::new().include_headers(true))
+                .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
+        )
         .layer(JwtLayer::<axum_masque::Claim, FetchDecodingKey>::new(
             validation,
             FetchDecodingKey::new(
                 "https://seera-networks.jp.auth0.com/.well-known/jwks.json".to_string(),
                 "HHTPL7guEDEcUT-9j0rC5".to_string(),
             ),
-        ));
+        ))
+        .layer(axum_masque::bound_udp::BoundUdpLayer::new());
+
+    let router = Router::new()
+        .route("/", axum::routing::get(|| async { "Hello, World!" }))
+        .layer(middleware);
 
     let token_cloned = token.clone();
     let handle_svc = tokio::spawn(async move {
