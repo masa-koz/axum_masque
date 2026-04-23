@@ -1,12 +1,15 @@
+use async_trait::async_trait;
 use axum::Router;
 use axum_masque::H3Router;
 use axum_masque::msquic_async::{
     H3MsQuicAsyncAcceptor,
     h3_msquic_async::{msquic, msquic_async},
 };
+use jwks::Jwks;
 use std::{io::Write, net::SocketAddr, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
+use tower_jwt::{DecodingKey, DecodingKeyFn, JwtLayer, Validation};
 
 fn make_msquic_async_listner(
     addr: Option<SocketAddr>,
@@ -49,6 +52,46 @@ fn make_msquic_async_listner(
     Ok((Arc::new(registration), listner))
 }
 
+#[derive(Clone)]
+struct FetchDecodingKey {
+    url: String,
+    kid: String,
+}
+
+impl FetchDecodingKey {
+    pub fn new(url: String, kid: String) -> Self {
+        Self { url, kid }
+    }
+}
+
+#[async_trait]
+impl DecodingKeyFn for FetchDecodingKey {
+    type Error = FetchDecodingKeyError;
+
+    async fn decoding_key(&self) -> Result<DecodingKey, Self::Error> {
+        tracing::debug!("Fetching JWKS from URL: {}", self.url);
+        let jwks = Jwks::from_jwks_url(&self.url).await;
+        match jwks {
+            Ok(mut jwks) => jwks
+                .keys
+                .remove(&self.kid)
+                .ok_or_else(|| FetchDecodingKeyError::KeyNotFound)
+                .map(|jwk| jwk.decoding_key),
+            Err(err) => {
+                tracing::error!("Failed to fetch JWKS: {}", err);
+                Err(FetchDecodingKeyError::FetchError(err))
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum FetchDecodingKeyError {
+    #[error("Failed to fetch JWKS: {0}")]
+    FetchError(#[from] jwks::JwksError),
+    #[error("Key not found")]
+    KeyNotFound,
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -63,8 +106,23 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = listener.local_addr()?;
     tracing::debug!("listenaddr : {}", listen_addr);
     let acceptor = H3MsQuicAsyncAcceptor::new(listener);
-    let router = Router::new().route("/", axum::routing::get(|| async { "Hello, World!" }))
-        .layer(axum_masque::bound_udp::BoundUdpLayer::new());
+
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_issuer(&["https://seera-networks.jp.auth0.com/"]);
+    validation.set_audience(&[
+        "https://masque.seera-networks.com/",
+        "https://seera-networks.jp.auth0.com/userinfo",
+    ]);
+    let router = Router::new()
+        .route("/", axum::routing::get(|| async { "Hello, World!" }))
+        .layer(axum_masque::bound_udp::BoundUdpLayer::new())
+        .layer(JwtLayer::<axum_masque::Claim, FetchDecodingKey>::new(
+            validation,
+            FetchDecodingKey::new(
+                "https://seera-networks.jp.auth0.com/.well-known/jwks.json".to_string(),
+                "HHTPL7guEDEcUT-9j0rC5".to_string(),
+            ),
+        ));
 
     let token_cloned = token.clone();
     let handle_svc = tokio::spawn(async move {

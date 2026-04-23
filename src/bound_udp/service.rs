@@ -7,6 +7,7 @@ use hyper::rt::Executor;
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tower::Service;
+use tower_jwt::RequestClaim;
 
 #[derive(Clone)]
 pub struct BoundUdp<S> {
@@ -47,8 +48,18 @@ where
     }
 
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        tracing::debug!("received request: {} {}", req.method(), req.uri().path());
         if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
-            let Some(proxy_state) = req.extensions_mut().remove::<crate::masque::ProxyState>() else {
+            let Some(claim) = req.extensions().get::<RequestClaim<crate::Claim>>().cloned() else {
+                tracing::warn!("missing Claim in request extensions");
+                let res = Response::builder()
+                    .status(http::StatusCode::UNAUTHORIZED)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                return Box::pin(futures::future::ready(Ok(res)));
+            };
+            let Some(proxy_state) = req.extensions_mut().remove::<crate::masque::ProxyState>()
+            else {
                 tracing::warn!("missing ProxyState in request extensions");
                 let res = Response::builder()
                     .status(http::StatusCode::SERVICE_UNAVAILABLE)
@@ -56,6 +67,7 @@ where
                     .unwrap();
                 return Box::pin(futures::future::ready(Ok(res)));
             };
+            tracing::info!("handling bound_udp_proxy request for subject {}", claim.claim.sub);
 
             let socket = match (
                 crate::validate_connect_udp(&req),
@@ -228,7 +240,10 @@ where
                     }
                 }
             });
-            tracing::info!("handling bound_udp_proxy, proxy public address is {}", proxy_public_addr);
+            tracing::info!(
+                "handling bound_udp_proxy, proxy public address is {}",
+                proxy_public_addr
+            );
             let res = Response::builder()
                 .status(http::StatusCode::OK)
                 .header("connect-udp-bind", "?1")

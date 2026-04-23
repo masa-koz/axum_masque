@@ -8,6 +8,7 @@ use h3_util::{server::H3Acceptor, server_body::H3IncomingServer};
 use http::{Request, Response};
 use http_body::Body;
 use hyper::rt::Executor;
+use serde::Deserialize;
 use std::future::Future;
 use tokio::sync::mpsc;
 
@@ -18,6 +19,12 @@ pub mod msquic_async {
 
 pub mod bound_udp;
 mod masque;
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct Claim {
+    /// Subject (whom the token refers to)
+    pub sub: String,
+}
 
 pub(crate) fn validate_connect_udp<ReqBody>(request: &Request<ReqBody>) -> bool
 where
@@ -173,7 +180,9 @@ where
                     if req.uri().path() == "/.well-known/masque/udp/%2A/%2A/" {
                         let (from_udp_to_quic_tx, from_udp_to_quic_rx) = mpsc::channel(1024);
                         let state = crate::masque::ProxyState {
-                            from_udp_to_quic: crate::masque::from_udp_to_quic::Controller::new(from_udp_to_quic_tx),
+                            from_udp_to_quic: crate::masque::from_udp_to_quic::Controller::new(
+                                from_udp_to_quic_tx,
+                            ),
                             from_quic_to_udp: crate::masque::from_quic_to_udp::Controller::new(
                                 stream_id,
                                 from_quic_to_udp_tx2,
@@ -181,12 +190,13 @@ where
                         };
                         req.extensions_mut().insert(state);
                         executor_clone2.execute(async move {
-                            crate::masque::from_udp_to_quic::thread(from_udp_to_quic_rx, datagram_sender)
-                                .await
-                                .unwrap();
+                            crate::masque::from_udp_to_quic::thread(
+                                from_udp_to_quic_rx,
+                                datagram_sender,
+                            )
+                            .await
+                            .unwrap();
                         });
-                    } else {
-                        tracing::debug!("received request for {}", req.uri().path());
                     }
                     if let Err(e) = serve_request::<AC, _, _>(req, stream, svc_cp.clone()).await {
                         tracing::warn!("server request failed: {}", e);

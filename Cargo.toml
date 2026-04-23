@@ -19,11 +19,17 @@ http = "1"
 http-body = "1"
 http-body-util = { version = "0.1.3", features = ["channel"] }
 hyper = { version = "1" , default-features = false}
+serde = { version = "1.0.164", features = ["derive", "rc" ] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tower = { version = "0.5", default-features = false, features = ["buffer", "util"] }
+tower-jwt = { git = "https://github.com/masa-koz/tower-jwt.git", branch = "masa-koz/update-jsonwebtoken" }
 tracing = "0.1.40"
 
 [dev-dependencies]
+async-trait = "0.1.77"
+jsonwebtoken = "10.3.0"
+jwks = "0.5.3"
 tempfile = "3"
+thiserror = "2.0.16"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }
