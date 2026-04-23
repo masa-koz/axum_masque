@@ -22,14 +22,16 @@ hyper = { version = "1" , default-features = false}
 serde = { version = "1.0.164", features = ["derive", "rc" ] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tower = { version = "0.5", default-features = false, features = ["buffer", "util"] }
-tower-jwt = { git = "https://github.com/masa-koz/tower-jwt.git", branch = "masa-koz/update-jsonwebtoken" }
+tower = { version = "0.5", default-features = false, features = ["buffer", "util", "make"] }
+tower-jwt = { git = "https://github.com/masa-koz/tower-jwt.git", branch = "masa-koz/use-latest" }
 tracing = "0.1.40"
 
 [dev-dependencies]
+argh = "0.1.10"
 async-trait = "0.1.77"
 jsonwebtoken = "10.3.0"
 jwks = "0.5.3"
+tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tempfile = "3"
 thiserror = "2.0.16"
 tower-http = { version = "0.6.8", features = ["full"] }

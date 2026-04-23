@@ -69,13 +69,17 @@ where
             };
             tracing::info!("handling bound_udp_proxy request for subject {}", claim.claim.sub);
 
+            let public_address = req.extensions().get::<crate::PublicAddress>().cloned().unwrap_or_else(|| {
+                let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                crate::PublicAddress { addr }
+            });
             let socket = match (
                 crate::validate_connect_udp(&req),
                 req.headers().get("connect-udp-bind"),
                 req.headers().get("capsule-protocol"),
             ) {
                 (true, Some(bind), Some(capsule)) if bind == "?1" && capsule == "?1" => {
-                    std::net::UdpSocket::bind("0.0.0.0:0").unwrap()
+                    std::net::UdpSocket::bind(public_address.addr).unwrap()
                 }
                 _ => {
                     tracing::warn!("invalid request");

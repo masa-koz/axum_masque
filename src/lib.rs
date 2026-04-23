@@ -9,7 +9,7 @@ use http::{Request, Response};
 use http_body::Body;
 use hyper::rt::Executor;
 use serde::Deserialize;
-use std::future::Future;
+use std::{future::Future, net::SocketAddr};
 use tokio::sync::mpsc;
 
 #[cfg(feature = "msquic-async")]
@@ -24,6 +24,11 @@ mod masque;
 pub struct Claim {
     /// Subject (whom the token refers to)
     pub sub: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicAddress {
+    pub addr: SocketAddr,
 }
 
 pub(crate) fn validate_connect_udp<ReqBody>(request: &Request<ReqBody>) -> bool

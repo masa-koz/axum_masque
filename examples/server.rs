@@ -1,5 +1,13 @@
+use argh::FromArgs;
 use async_trait::async_trait;
-use axum::{Router, body::Bytes, http::header};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{Request, State},
+    http::header,
+    middleware,
+    response::Response,
+};
 use axum_masque::H3Router;
 use axum_masque::msquic_async::{
     H3MsQuicAsyncAcceptor,
@@ -9,12 +17,14 @@ use jwks::Jwks;
 use std::{io::Write, net::SocketAddr, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
-use tower::ServiceBuilder;
+use tower::{ServiceBuilder, make::MakeService, service_fn};
 use tower_http::{
     LatencyUnit, ServiceBuilderExt,
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
 };
-use tower_jwt::{DecodingKey, DecodingKeyFn, JwtLayer, Validation};
+use tower_jwt::{DecodingKey, DecodingKeyFn, JwtLayer, RequestClaim, Validation};
+
+mod public_address_store;
 
 fn make_msquic_async_listner(
     addr: Option<SocketAddr>,
@@ -97,6 +107,25 @@ enum FetchDecodingKeyError {
     #[error("Key not found")]
     KeyNotFound,
 }
+
+#[derive(Debug, Clone)]
+struct AppState {
+    public_address_store: public_address_store::Store,
+}
+
+#[derive(FromArgs, Clone)]
+/// server args
+pub struct CmdOptions {
+    /// service address
+    #[argh(option, default = "String::from(\"127.0.0.1:8443\")")]
+    service_addr: String,
+
+    /// public address db path
+    #[argh(option, default = "String::from(\"./public_address.db\")")]
+    public_address_db: String,
+}
+
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -105,12 +134,18 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let cmd_opts: CmdOptions = argh::from_env();
+
     let token = CancellationToken::new();
-    let addr: SocketAddr = "127.0.0.1:5047".parse()?;
+    let addr: SocketAddr = cmd_opts.service_addr.parse()?;
     let (_registration, listener) = make_msquic_async_listner(Some(addr))?;
     let listen_addr = listener.local_addr()?;
-    tracing::debug!("listenaddr : {}", listen_addr);
+    tracing::info!("service listening on: {}", listen_addr);
     let acceptor = H3MsQuicAsyncAcceptor::new(listener);
+
+    let public_address_store =
+        public_address_store::Store::new(&cmd_opts.public_address_db).await?;
+    let state = AppState { public_address_store };
 
     let sensitive_headers: Arc<[_]> = vec![header::AUTHORIZATION, header::COOKIE].into();
 
@@ -121,16 +156,41 @@ async fn main() -> anyhow::Result<()> {
         "https://seera-networks.jp.auth0.com/userinfo",
     ]);
 
+    async fn read_public_address(
+        State(state): State<AppState>,
+        mut req: Request,
+        next: middleware::Next,
+    ) -> Response {
+        if let Some(claim) = req
+            .extensions()
+            .get::<RequestClaim<axum_masque::Claim>>()
+            .cloned()
+        {
+            tracing::debug!("User claim in middleware: sub={}", claim.claim.sub);
+            let addr = state.public_address_store.get(&claim.claim.sub).await.ok().flatten().map(|addr_str| {
+                tracing::debug!("Found public address for sub {}: {}", claim.claim.sub, addr_str);
+                addr_str.parse::<SocketAddr>().ok()
+            }).flatten();
+            if let Some(addr) = addr {
+                tracing::debug!("Inserting public address into request extensions: {}", addr);
+                req.extensions_mut()
+                    .insert(axum_masque::PublicAddress { addr });
+            }
+        }
+        let response = next.run(req).await;
+        response
+    }
+
     let middleware = ServiceBuilder::new()
-        .sensitive_request_headers(sensitive_headers.clone())
-        .layer(
-            TraceLayer::new_for_http()
-                .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
-                    tracing::trace!(size_bytes = chunk.len(), latency = ?latency, "sending body chunk")
-                })
-                .make_span_with(DefaultMakeSpan::new().include_headers(true))
-                .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
-        )
+        // .sensitive_request_headers(sensitive_headers.clone())
+        // .layer(
+        //     TraceLayer::new_for_http()
+        //         .on_body_chunk(|chunk: &Bytes, latency: Duration, _: &tracing::Span| {
+        //             tracing::trace!(size_bytes = chunk.len(), latency = ?latency, "sending body chunk")
+        //         })
+        //         .make_span_with(DefaultMakeSpan::new().include_headers(true))
+        //         .on_response(DefaultOnResponse::new().include_headers(true).latency_unit(LatencyUnit::Micros)),
+        // )
         .layer(JwtLayer::<axum_masque::Claim, FetchDecodingKey>::new(
             validation,
             FetchDecodingKey::new(
@@ -138,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
                 "HHTPL7guEDEcUT-9j0rC5".to_string(),
             ),
         ))
+        .layer(middleware::from_fn_with_state(state.clone(),read_public_address))
         .layer(axum_masque::bound_udp::BoundUdpLayer::new());
 
     let router = Router::new()
